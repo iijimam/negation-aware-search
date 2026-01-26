@@ -643,7 +643,7 @@ def get_simirality_ranking(query_text):
                 #"score_text_norm": r.get("score_text_norm"),
                 #"final_score": r.get("final_score"),
                 # SectionText は使わない方針なら保存しない（必要ならコメント解除）
-                "SectionText": r.get("SectionText"),
+                #"SectionText": r.get("SectionText"),
                 "FlagsJson": doc_flags,
             }
         )
