@@ -6,11 +6,13 @@
 
 特に、肯定・否定を区別することが重要な場面では、誤った回答を返すこともあるため、この問題は無視できないものとなります。
 
+この記事は、新しいアルゴリズムをご紹介するものではありません。否定表現によって類似検索が失敗する場合に、実際に役立つと感じた方法を共有するために書きました。
+
 ![](./assets/image.jpg)
 
 そこで、この記事では、ベクトル検索では扱いきれない「論理の違い」をLLMとSQLを組み合わせて補完した構成をご紹介します。
 
->本記事はアルゴリズム実装解説ではなく、設計パターンの共有を目的としています。
+記事で中心に登場するサンプルデータは退院サマリーを使用していますが、パターン自体はドメインに依存せず、構成と否定が重要となるあらゆるドメインに適用できるものです。
 
 以下の流れでご紹介します。
 
@@ -58,6 +60,10 @@
 
 データ数の問題というよりも、「インフルエンザ」「発熱」「入院経過」といった文脈が共通しているため、酸素投与の有無という論理的な差異が類似度に反映されにくい例と言えます。
 
+> この「論理的な違い」を確認される場合は、サンプルコードに含めている [vectortest.py](./src/vectortest.py)を実行すると確認できます。
+>
+> サンプルで動かすコンテナ内での実行方法： `python3 /src/vectortest.py`
+
 では、なぜ、「内容として正反対」がヒットしてしまうのでしょうか。
 
 
@@ -91,9 +97,75 @@ Embeddingモデルは特定ドメインに特化したものもあります。
 
 なお、重要用語をLLMに自動的に抽出させるのではなく、抽出したい用語をプロンプトで指定しています。
 
-テストで使用したプロンプトの一部は以下の通りです。
+サンプルコードに含まれるプロンプト全体は、ドメイン固有の辞書やガードレールを含むため、長文です。記事の読みやすさを保つため、折りたたみ可能なブロックで表示します。非医療の例については、短縮版プロンプトでご紹介します。
+
+---
+
+質問文（フリーテキスト）:
+>サービスに一時的なエラーが発生しましたが、システムは再起動されませんでした。回避策が適用され、ダウンタイムなしでインシデントは解決されました。
+
+意味的には類似しているが論理的には正反対のログエントリ：
+>サービスに一時的なエラーが発生したため、復旧のためにシステムを再起動しました。
+
+これは、意味的な類似性は高いと言えますが、否定により操作上の決定が異なる典型的な例です。
+
+この領域では、例えば以下のような少数の操作フラグを抽出できるでしょう：
+- HasServiceRestarted (1 / 0 / null)
+- HasWorkaroundApplied (1 / 0 / null)
+- HasDowntime (1 / 0 / null)
+
+短縮版プロンプトの例は以下の通りです：
 
 ```
+ログテキストから以下のフラグが明示的に記述されている場合のみ抽出してください：
+- HasServiceRestarted
+- HasWorkaroundApplied
+- HasDowntime
+
+ルール：
+- value = 1 は明示的に記述されている場合のみ
+- value = 0 は明示的に否定されている場合のみ
+- value = null は明示的に言及されていない場合
+- 推論禁止；否定はフラグ間で伝播しない
+```
+
+抽出されるJSON例（短縮）:
+```json
+{
+    "HasServiceRestarted": {
+        "value": 0,
+        "evidence": "the system was not restarted",
+        "confidence": 1.0
+    }
+}
+```
+
+このフローの中でのLLMの利用は、ベクトル検索の前処理と後処理に登場します。
+
+- 前処理
+
+    フリーテキスト（質問文／データベースにある文）から重要用語として設定した用語とその状態をLLMに抽出させます（結果はフォーマット固定のJSONで受け取ります）。
+
+    データベースに登録する文章については、重要用語の中で強く絞り込みを用語を定め、カラムとして定義し値（0/1/null）をテーブルに登録します。
+
+
+- 後処理
+
+    ベクトル検索結果の上位3件が質問文と正しく類似しているかの最終チェックに、LLMによる審査（LLM as a Judge）を行います。
+
+    審査時に、前処理で抽出した質問文の重要用語とその状態のJSON、データベースから抽出した同様のJSONを比較させ、意味的に矛盾がないことを確認します。
+
+
+用語に関するメモ（医学例のみ）：
+- HNFC：酸素を増やすための高流量鼻カニュラによる酸素療法
+- NPPV：呼吸を助けるためのマスクを使った非侵襲的人工呼吸療法
+
+> 注記：以下の抽出プロンプトは、否定処理が本記事の核心であるため意図的に詳細に記述されています。他の領域においても、同じ構造が適用されます。変更されるのはフラグ名と辞書用語のみです。
+
+<details>
+<summary>使用しているプロンプトは以下の通りです:</summary>
+
+```python
 SYSTEM_PROMPT = """あなたは医療文書から「入力テキストに明示された記載」だけに基づいて、指定フラグを構造化抽出する情報抽出器です。
 出力は **JSONオブジェクトのみ** とし、未確定は **null** を使ってください。
 # 最重要ルール（推論ゼロ）
@@ -120,173 +192,238 @@ SYSTEM_PROMPT = """あなたは医療文書から「入力テキストに明示�
 - HasIntubation:
   - 1: 挿管 / 気管挿管 / 挿管管理
   - 0: 挿管せず / 非挿管
-＜省略＞
+- HasMechanicalVentilation:
+  - 1: 人工呼吸器管理 / 機械換気 / ventilator / MV管理
+  - 0: 人工呼吸器なし / 機械換気なし
+- HasTracheostomy:
+  - 1: 気管切開
+  - 0: 気管切開なし
+- HasICUCare:
+  - 1: ICU入室 / ICU管理 / 集中治療室で管理
+  - 0: ICU入室せず / ICU管理なし
+- HasSepsis:
+  - 1: 敗血症 / Sepsis
+  - 0: 敗血症なし / 敗血症ではない（明示がある場合のみ）
+- HasShock:
+  - 1: ショック / 循環不全 / ショックバイタル
+  - 0: ショックなし（明示がある場合のみ）
+- HasVasopressor:
+  - 1: 昇圧剤 / ノルアドレナリン / バソプレシン / ドパミン
+  - 0: 昇圧剤なし / 使用せず（明示がある場合のみ）
+- HasAKI:
+  - 1: AKI / 急性腎障害 / 急性腎不全
+  - 0: AKIなし（明示がある場合のみ）
+- HasDialysis:
+  - 1: 透析 / CHDF / HD / HDF / CRRT
+  - 0: 透析なし / 導入せず（明示がある場合のみ）
+- HasDiabetes:
+  - 1: 糖尿病 / DM / 1型 / 2型
+  - 0: 糖尿病なし（明示がある場合のみ）
+- HasInsulinUse:
+  - 1: インスリン導入 / 開始 / 投与
+  - 0: インスリンなし / 導入せず / 中止（明示がある場合のみ）
+- HasAntibioticsIV:
+  - 1: 点滴抗菌薬 / 静注抗菌薬 / 抗菌薬点滴 / 静注開始
+  - 0: 抗菌薬投与せず（明示がある場合のみ）
+- HasAntibioticsPO:
+  - 1: 内服抗菌薬 / 経口抗菌薬 / 内服へ切替
+  - 0: 内服抗菌薬なし（明示がある場合のみ）
+- HasSteroidSystemic:
+  - 1: ステロイド投与 / PSL / プレドニゾロン / メチルプレドニゾロン（全身）
+  - 0: ステロイドなし / 使用せず / 中止（明示がある場合のみ）
+# 出力制約
+- JSON以外を出力したら失敗です。必ず { から始まり } で終わる JSONオブジェクトのみを返してください。
+- 指定された全フラグを必ず出力する（value/polarity/evidence/confidence/note を含める）。
+- value が null のときは polarity="unknown", evidence=null, confidence=0.0 を基本とする
+"""
+
+OUTPUT_FORMAT2 = """
+{
+  "schema_version": "flags.v2",
+  "doc_type": "query",
+  "flags": {
+    "<FlagName>": {
+      "value": 1 or 0 or null,
+      "polarity": "affirmed" or "negated" or "unknown",
+      "evidence": "<根拠抜粋。valueがNoneならnullで可>",
+      "confidence": 0.0-1.0,
+      "scope": "inpatient" or "history" or "discharge_plan" or "unknown",
+      "note": "<迷いがあれば短く。なければ空文字>"
+    }
+  }
+}
+"""
+
+FLAGNAME = """
+# 抽出対象フラグ（このキー名のまま全て出力）
+- HasOxygenTherapy
+- HasHFNC
+- HasNPPV
+- HasIntubation
+- HasMechanicalVentilation
+- HasTracheostomy
+- HasICUCare
+- HasSepsis
+- HasShock
+- HasVasopressor
+- HasAKI
+- HasDialysis
+- HasDiabetes
+- HasInsulinUse
+- HasAntibioticsIV
+- HasAntibioticsPO
+- HasSteroidSystemic
+"""
 ```
->用語メモ：
-> - HNFC：酸素を増やすための高流量鼻カニュラによる酸素療法
-> - NPPV：呼吸を助けるためのマスクを使った非侵襲的人工呼吸療法
+</details>
 
-
-このフローの中でのLLMの利用は、ベクトル検索の前処理と後処理に登場します。
-
-- 前処理
-
-    フリーテキスト（質問文／データベースにある文）から重要用語として設定した用語とその状態をLLMに抽出させます（結果はフォーマット固定のJSONで受け取ります）。
-
-    データベースに登録する文章については、重要用語の中で強く絞り込みを用語を定め、カラムとして定義し値（0/1/null）をテーブルに登録します。
-
-
-- 後処理
-
-    ベクトル検索結果の上位3件が質問文と正しく類似しているかの最終チェックに、LLMによる審査（LLM as a Judge）を行います。
-
-    審査時に、前処理で抽出した質問文の重要用語とその状態のJSON、データベースから抽出した同様のJSONを比較させ、意味的に矛盾がないことを確認します。
+<br>
 
 <details>
-
 <summary>フリーテキストから重要用語とその状態をLLMに抽出してもらったJSON例：</summary>
 
-    【入院経過】発熱と咳嗽で入院。迅速検査でインフルエンザ陽性。呼吸苦がありSpO2低下に対し酸素投与を短期間実施。肺炎所見は明確でなく対症療法中心に改善し自宅退院。
-    ```
-    {
-        "HasOxygenTherapy": {
-            "value": 1,
-            "polarity": "affirmed",
-            "evidence": "呼吸苦がありSpO2低下に対し酸素投与を短期間実施",
-            "confidence": 1.0,
-            "scope": "inpatient",
-            "note": ""
-        },
-        "HasHFNC": {
-            "value": null,
-            "polarity": "unknown",
-            "evidence": null,
-            "confidence": 0.0,
-            "scope": "unknown",
-            "note": ""
-        },
-        "HasNPPV": {
-            "value": null,
-            "polarity": "unknown",
-            "evidence": null,
-            "confidence": 0.0,
-            "scope": "unknown",
-            "note": ""
-        },
-        "HasIntubation": {
-            "value": null,
-            "polarity": "unknown",
-            "evidence": null,
-            "confidence": 0.0,
-            "scope": "unknown",
-            "note": ""
-        },
-        "HasMechanicalVentilation": {
-            "value": null,
-            "polarity": "unknown",
-            "evidence": null,
-            "confidence": 0.0,
-            "scope": "unknown",
-            "note": ""
-        },
-        "HasTracheostomy": {
-            "value": null,
-            "polarity": "unknown",
-            "evidence": null,
-            "confidence": 0.0,
-            "scope": "unknown",
-            "note": ""
-        },
-        "HasICUCare": {
-            "value": null,
-            "polarity": "unknown",
-            "evidence": null,
-            "confidence": 0.0,
-            "scope": "unknown",
-            "note": ""
-        },
-        "HasSepsis": {
-            "value": null,
-            "polarity": "unknown",
-            "evidence": null,
-            "confidence": 0.0,
-            "scope": "unknown",
-            "note": ""
-        },
-        "HasShock": {
-            "value": null,
-            "polarity": "unknown",
-            "evidence": null,
-            "confidence": 0.0,
-            "scope": "unknown",
-            "note": ""
-        },
-        "HasVasopressor": {
-            "value": null,
-            "polarity": "unknown",
-            "evidence": null,
-            "confidence": 0.0,
-            "scope": "unknown",
-            "note": ""
-        },
-        "HasAKI": {
-            "value": null,
-            "polarity": "unknown",
-            "evidence": null,
-            "confidence": 0.0,
-            "scope": "unknown",
-            "note": ""
-        },
-        "HasDialysis": {
-            "value": null,
-            "polarity": "unknown",
-            "evidence": null,
-            "confidence": 0.0,
-            "scope": "unknown",
-            "note": ""
-        },
-        "HasDiabetes": {
-            "value": null,
-            "polarity": "unknown",
-            "evidence": null,
-            "confidence": 0.0,
-            "scope": "history",
-            "note": ""
-        },
-        "HasInsulinUse": {
-            "value": null,
-            "polarity": "unknown",
-            "evidence": null,
-            "confidence": 0.0,
-            "scope": "unknown",
-            "note": ""
-        },
-        "HasAntibioticsIV": {
-            "value": null,
-            "polarity": "unknown",
-            "evidence": null,
-            "confidence": 0.0,
-            "scope": "inpatient",
-            "note": ""
-        },
-        "HasAntibioticsPO": {
-            "value": null,
-            "polarity": "unknown",
-            "evidence": null,
-            "confidence": 0.0,
-            "scope": "inpatient",
-            "note": ""
-        },
-        "HasSteroidSystemic": {
-            "value": null,
-            "polarity": "unknown",
-            "evidence": null,
-            "confidence": 0.0,
-            "scope": "inpatient",
-            "note": ""
-        }
-    }   
-    ```
+【入院経過】発熱と咳嗽で入院。迅速検査でインフルエンザ陽性。呼吸苦がありSpO2低下に対し酸素投与を短期間実施。肺炎所見は明確でなく対症療法中心に改善し自宅退院。
+
+```json
+{
+    "HasOxygenTherapy": {
+        "value": 1,
+        "polarity": "affirmed",
+        "evidence": "呼吸苦がありSpO2低下に対し酸素投与を短期間実施",
+        "confidence": 1.0,
+        "scope": "inpatient",
+        "note": ""
+    },
+    "HasHFNC": {
+        "value": null,
+        "polarity": "unknown",
+        "evidence": null,
+        "confidence": 0.0,
+        "scope": "unknown",
+        "note": ""
+    },
+    "HasNPPV": {
+        "value": null,
+        "polarity": "unknown",
+        "evidence": null,
+        "confidence": 0.0,
+        "scope": "unknown",
+        "note": ""
+    },
+    "HasIntubation": {
+        "value": null,
+        "polarity": "unknown",
+        "evidence": null,
+        "confidence": 0.0,
+        "scope": "unknown",
+        "note": ""
+    },
+    "HasMechanicalVentilation": {
+        "value": null,
+        "polarity": "unknown",
+        "evidence": null,
+        "confidence": 0.0,
+        "scope": "unknown",
+        "note": ""
+    },
+    "HasTracheostomy": {
+        "value": null,
+        "polarity": "unknown",
+        "evidence": null,
+        "confidence": 0.0,
+        "scope": "unknown",
+        "note": ""
+    },
+    "HasICUCare": {
+        "value": null,
+        "polarity": "unknown",
+        "evidence": null,
+        "confidence": 0.0,
+        "scope": "unknown",
+        "note": ""
+    },
+    "HasSepsis": {
+        "value": null,
+        "polarity": "unknown",
+        "evidence": null,
+        "confidence": 0.0,
+        "scope": "unknown",
+        "note": ""
+    },
+    "HasShock": {
+        "value": null,
+        "polarity": "unknown",
+        "evidence": null,
+        "confidence": 0.0,
+        "scope": "unknown",
+        "note": ""
+    },
+    "HasVasopressor": {
+        "value": null,
+        "polarity": "unknown",
+        "evidence": null,
+        "confidence": 0.0,
+        "scope": "unknown",
+        "note": ""
+    },
+    "HasAKI": {
+        "value": null,
+        "polarity": "unknown",
+        "evidence": null,
+        "confidence": 0.0,
+        "scope": "unknown",
+        "note": ""
+    },
+    "HasDialysis": {
+        "value": null,
+        "polarity": "unknown",
+        "evidence": null,
+        "confidence": 0.0,
+        "scope": "unknown",
+        "note": ""
+    },
+    "HasDiabetes": {
+        "value": null,
+        "polarity": "unknown",
+        "evidence": null,
+        "confidence": 0.0,
+        "scope": "history",
+        "note": ""
+    },
+    "HasInsulinUse": {
+        "value": null,
+        "polarity": "unknown",
+        "evidence": null,
+        "confidence": 0.0,
+        "scope": "unknown",
+        "note": ""
+    },
+    "HasAntibioticsIV": {
+        "value": null,
+        "polarity": "unknown",
+        "evidence": null,
+        "confidence": 0.0,
+        "scope": "inpatient",
+        "note": ""
+    },
+    "HasAntibioticsPO": {
+        "value": null,
+        "polarity": "unknown",
+        "evidence": null,
+        "confidence": 0.0,
+        "scope": "inpatient",
+        "note": ""
+    },
+    "HasSteroidSystemic": {
+        "value": null,
+        "polarity": "unknown",
+        "evidence": null,
+        "confidence": 0.0,
+        "scope": "inpatient",
+        "note": ""
+    }
+}
+```
 </details>
 
 <br>
@@ -450,9 +587,139 @@ Cross Encoder は否定・肯定といった論理構造を理解するもので
 
 最後のLLM as a Judgeに渡しているJSONには、質問文とリランク後のTOP3の重要用語とその状態、ランキングのスコアが含まれています。
 <details>
-<summary>実際に渡しているJSONの中身（プロンプトなどはソースコードをご参照下さい：<a href="./src/UI_embedded_python/app.py">app.py</a>）</summary>
+<summary>実際に渡しているプロンプトとフラグの中身（詳細はソースコードをご参照下さい：<a href="./src/UI_embedded_python/app.py">app.py</a>）</summary>
 
+```python
+SYSTEM_PROMPT = """
+あなたはランキング候補(top3)の妥当性を判定する Judge です。
+判定に使う情報は「query_flags と ranked_top3[].FlagsJson の value」のみ。
+query_text / SectionText / evidence の文章を読んで再解釈してはいけません。
+
+# 値の扱い
+value は 1/0/null。null は「不明」であり矛盾ではない。
+
+# mismatch は強フラグ矛盾だけ（これ以外で mismatch 禁止）
+強フラグ = HasICUCare, HasNPPV, HasMechanicalVentilation, HasIntubation, HasDialysis, HasVasopressor
+mismatch 条件は次の2つのみ:
+(A) query=1 かつ doc=0
+(B) query=1 かつ doc!=1（docがnull/0を含む）
+※強フラグ以外は(A)(B)を適用しない。
+
+# 弱フラグは decision に使わない（絶対）
+弱フラグ = HasOxygenTherapy, HasAntibioticsIV, HasAntibioticsPO, HasSteroidSystemic
+弱フラグは「説明に書いてよい」だけで、is_similar_enough の判定根拠にしてはいけない。
+
+# verdict ルール
+- match: 強フラグ矛盾がなく、主要フラグの整合が高い
+- partial: 強フラグ矛盾はないが、情報が薄く確信が弱い
+- mismatch: 強フラグ矛盾(A)(B)が1つでもあれば必ず mismatch
+
+# decision の作り方（強制・例外なし）
+- decision.top_doc_id = ranking[0].doc_id
+- decision.is_similar_enough = (ranking[0].verdict != "mismatch")
+- decision.summary は ranking[0] の verdict と、強フラグ矛盾の有無だけを短く述べる。
+  「確認されている」「〜が行われた」等の臨床イベント断定は禁止（value=1 のフラグ名だけ書く）。
+
+# reasons の status 判定（機械的ルール）
+各フラグごとに以下で status を決める（例外なし）:
+
+(1) query が null または doc が null → status=neutral
+(2) query が 0/1 で doc が 0/1 かつ一致 → status=match
+(3) query が 0/1 で doc が 0/1 かつ不一致 → status=contradict
+ただし (3) の "contradict" を許可するのは「強フラグ」かつ query=1 & doc!=1 のときのみ。
+それ以外の不一致はすべて neutral とする（弱フラグは決して contradict にしない）。
+
+# 出力
+必ずJSONのみ:
+{
+  "decision": {"top_doc_id": <int>, "is_similar_enough": <bool>, "confidence": <0-1>, "summary": "<短い日本語>", "missing_info": []},
+  "ranking": [{"doc_id": <int>, "rank": 1, "relevance": <0-1>, "verdict": "match|partial|mismatch", "reasons": [...]}, ...]
+}
+"""
+
+JUDGE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["decision", "ranking"],
+    "properties": {
+        "decision": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["top_doc_id","is_similar_enough", "confidence", "summary", "missing_info"],
+            "properties": {
+                "top_doc_id": {"type": "number"},
+                "is_similar_enough": {"type": "boolean"},
+                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "summary": {"type": "string"},
+                "missing_info": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+        "ranking": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 3,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["doc_id", "rank", "relevance", "verdict", "reasons"],
+                "properties": {
+                    "doc_id": {"type": "number"},
+                    "rank": {"type": "number"},
+                    "relevance": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    "verdict": {"type": "string", "enum": ["match", "partial", "mismatch"]},
+                    "reasons": {"type": "array", "items": {"type": "string"}, "maxItems": 5},
+                },
+            },
+        },
+    },
+}
+
+def build_user_prompt(item: dict) -> str:
+    return f"""次の入力(JSON)について判定してください。
+
+入力(JSON):
+<<<
+{json.dumps(item, ensure_ascii=False)}
+>>>
+
+最重要: decision は「rank1（最上位候補）に対する結論」とする。
+- decision.is_similar_enough は rank1 の候補がクエリと類似しているかのみで判定する。
+- rank2/3 に矛盾があっても decision を False にしてはいけない（decision は rank1 のみを見る）。
+- decision.summary / decision.reasons は rank1 の内容だけに基づいて書く。rank2/3 に言及しない。
+- decision.top_doc_id と decision.top_rank を必ず出力する（top_rankは常に1）。
+
+decision と verdict の整合:
+- rank1.verdict が match のとき、decision.is_similar_enough は必ず true
+- rank1.verdict が mismatch のとき、decision.is_similar_enough は必ず false
+- rank1.verdict が partial のときは true/false どちらも可（confidenceで調整）
+
+判定の優先順位:
+(1) クエリで明示されたフラグ(0/1)の一致・矛盾（最重要）
+(2) ICU/NPPV/MVなど重症度イベントの矛盾
+(3) 疾患（肺炎など）の一致
+(4) 転帰や細部は補助
+nullは「不明」であり、0とは違う。
+
+制約:
+- rankingは必ず3件(入力の3候補を必ず含める)
+- reasonsは各候補 最大5個、短く具体的に、クエリで明示されたフラグ(0/1)と疾患・重症度を中心に
+- relevanceは0.0〜1.0
+- relevanceは相対値。rank1>rank2>rank3 となるように差をつけること（同点禁止）
+- verdictの定義は以下の通り:
+    - match: 強フラグ(ICU/NPPV/MV/挿管/透析/昇圧剤)の矛盾がなく、主要情報が整合
+    - partial: 強フラグ矛盾はないが、情報が薄い/疾患が不明/弱フラグが揃わず確信が弱い
+    - mismatch: 強フラグに限り、クエリで明示(query=1)された強フラグが doc で満たされない場合のみ
+      (query=1 & doc!=1)
+※HasOxygenTherapy を含む弱フラグでは mismatch にしない
+- クエリで未言及(value=null)の弱フラグ(Sepsis, Shock, AKI, Diabetes, InsulinUse, AntibioticsIV/PO, SteroidSystemic)は、verdict を下げる主要因にしない。
+- クエリで未言及のフラグ（酸素など）で mismatch にしない
+- decision.top_doc_id は ranking[0].doc_id(rank=1の候補)と同じ値にする。
+- JSON以外は禁止
+"""
 ```
+審査に渡すJSON
+
+```json
 {'query_flags': {'HasOxygenTherapy': {'value': 1, 'polarity': 'affirmed', 'evidence': 'SpO2低下のため短期間酸素投与しました', 'confidence': 1.0, 'scope': 'inpatient', 'note': ''
         }, 'HasHFNC': {'value': None, 'polarity': 'unknown', 'evidence': None, 'confidence': 0.0, 'scope': 'inpatient', 'note': ''
         }, 'HasNPPV': {'value': None, 'polarity': 'unknown', 'evidence': None, 'confidence': 0.0, 'scope': 'inpatient', 'note': ''
@@ -563,9 +830,12 @@ SQLの実行はSQLAlchemyでも行えますが、Embedded Pythonを利用する�
 
 - IT運用・障害対応（運用ログ／インシデント記録）
 
-    例：「○○のエラーが出たが、再起動はしていない。暫定対応のみ実施」の中で「再起動した／してない」により対応が変わることが予想されます。
+    例：「エラーが発生したが、システムは再起動されず、一時的な回避策が適用された」
+
+    アクションが実行されたか否か（再起動 vs. 未再起動、回避策適用 vs. 未適用）は、適切な対応を左右することが多い例。
     
-    「対応した／していない」「回避策あり／なし」の否定・肯定の判断が障害対応でも重要になってきます。
+    この領域で利用されそうな典型的なフラグは以下：HasServiceRestarted、HasWorkaroundApplied、HasDowntime（1 / 0 / null）
+
 
 - 契約・法務・コンプライアンス（契約条文・過去判断）
 
@@ -610,6 +880,7 @@ SQLの実行はSQLAlchemyでも行えますが、Embedded Pythonを利用する�
 
 重要用語を指定できれば例に登場した医療情報だけでなく、否定・肯定の判断を重要とする他ドメインでも利用できます。
 
+これは新しい手法ではなく、既存のアイデアの組み合わせです。この具体的な例が、ベクトル検索における否定処理に苦労している方々の助けになれば幸いです。
 
 ## (9)サンプル実行方法
 
@@ -627,7 +898,7 @@ docker compose up -d
 
 コンテナにログインし、以下のどちらかを実行してください。
 ```
-docker exec -it nagation_aware_search bash
+docker exec -it negation_aware_search bash
 ```
 
 - Embedded Python版
@@ -640,7 +911,7 @@ docker exec -it nagation_aware_search bash
     /usr/irissys/bin/irispython /home/irisowner/.local/bin/streamlit run /src/UI_embedded_python/app.py --server.port 8080 --logger.level=debug
     ```
 
-    画面の起動：[http://localhost:8081](http://localhost:8081)
+    画面の起動：[http://localhost:8081](http://localhost:8081) (コンテナのポート8080からマッピング)
 
 - SQLAlchemy版
 
@@ -652,7 +923,9 @@ docker exec -it nagation_aware_search bash
     /home/irisowner/.local/bin/streamlit run /src/UI_sqlalchemy/app.py --server.port 8090 --logger.level=debug
     ```
 
-    画面の起動：[http://localhost:8091](http://localhost:8091)
+    画面の起動：[http://localhost:8091](http://localhost:8091)  (コンテナのポート8090からマッピング)
+
+![](./assets/sampleapp-image-jp.jpg)
 
 - 質問サンプル
     - 発熱と咳はありましたが、酸素は使わずに経過しました。肺炎で入院しましたが比較的軽症でした。
